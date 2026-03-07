@@ -968,3 +968,167 @@ function buildGuildFoldersForMoveToTop(currentFolders, guildId) {
     return nextFolders;
 }
 
+async function moveGuildToTop(guildId, deps, options = {}) {
+    const pollIntervalMs = options.pollIntervalMs ?? POLL_INTERVAL_MS;
+    const pollTimeoutMs = options.pollTimeoutMs ?? POLL_TIMEOUT_MS;
+    const logger = options.logger ?? null;
+
+    if (!guildId) return {status: "error", reason: "Guild id was missing"};
+    if (!deps || typeof deps.getGuildOrder !== "function") return {status: "error", reason: "Guild order accessor missing"};
+
+    const currentOrder = normalizeGuildOrder(tryGet(deps.getGuildOrder));
+    logger?.debug("moveGuildToTop called", {guildId, currentOrder: summarizeOrder(currentOrder)});
+    const fromIndex = currentOrder.indexOf(guildId);
+    if (fromIndex === -1) return {status: "error", reason: `Guild ${guildId} was not found in the current order`};
+    if (fromIndex === 0) return {status: "noop", reason: "Guild is already at top"};
+    const targetId = currentOrder.find((id) => id !== guildId) ?? null;
+
+    const dispatchGuildMoveById = deps?.dispatchGuildMoveById;
+    const move = deps?.guildActions?.move;
+    if (typeof move === "function" && targetId) {
+        const moveByIdAttempts = [
+            {name: "move(sourceId,targetId)", run: () => move(guildId, targetId)},
+            {name: "move({sourceId,targetId})", run: () => move({sourceId: guildId, targetId})}
+        ];
+
+        for (const attempt of moveByIdAttempts) {
+            logger?.debug("Attempting move-by-id strategy", {
+                strategy: attempt.name,
+                sourceId: guildId,
+                targetId
+            });
+            try {
+                attempt.run();
+            }
+            catch (error) {
+                logger?.warn("Move-by-id strategy threw", {strategy: attempt.name, error});
+                continue;
+            }
+
+            const movedByMoveAction = await waitForGuildAtTop(guildId, deps.getGuildOrder, pollIntervalMs, pollTimeoutMs);
+            if (movedByMoveAction) {
+                await persistCurrentGuildFolders(deps, logger);
+                return {status: "moved"};
+            }
+            logger?.warn("Move-by-id strategy completed but order unchanged", {
+                strategy: attempt.name,
+                currentOrder: summarizeOrder(normalizeGuildOrder(tryGet(deps.getGuildOrder)))
+            });
+        }
+    }
+
+    if (typeof dispatchGuildMoveById === "function") {
+        const latestOrder = normalizeGuildOrder(tryGet(deps.getGuildOrder));
+        const dispatchTargetId = latestOrder.find((id) => id !== guildId) ?? targetId;
+
+        if (dispatchTargetId) {
+            logger?.debug("Attempting dispatch strategy", {
+                strategy: "dispatchGuildMoveById(sourceId,targetId)",
+                sourceId: guildId,
+                targetId: dispatchTargetId
+            });
+
+            try {
+                dispatchGuildMoveById(guildId, dispatchTargetId);
+                const movedByDispatch = await waitForGuildAtTop(guildId, deps.getGuildOrder, pollIntervalMs, pollTimeoutMs);
+                if (movedByDispatch) {
+                    await persistCurrentGuildFolders(deps, logger);
+                    return {status: "moved"};
+                }
+                logger?.warn("Dispatch strategy completed but order unchanged", {
+                    strategy: "dispatchGuildMoveById(sourceId,targetId)",
+                    currentOrder: summarizeOrder(normalizeGuildOrder(tryGet(deps.getGuildOrder)))
+                });
+            }
+            catch (error) {
+                logger?.warn("Dispatch strategy threw", {error});
+            }
+        }
+    }
+
+    const saveGuildFolders = deps?._saveGuildFoldersDisabled
+        ? null
+        : (deps?.saveGuildFolders ?? deps?.folderSettings?.saveGuildFolders);
+    const saveConfidence = getSaveGuildFoldersConfidenceFromDeps(deps);
+    const getGuildFolders = deps?.getGuildFolders;
+    if (typeof saveGuildFolders === "function" && typeof getGuildFolders === "function" && saveConfidence > 0) {
+        const currentFolders = tryGet(getGuildFolders);
+        logger?.debug("Attempting saveGuildFolders strategy", {
+            currentFolders: summarizeFolders(currentFolders),
+            saveGuildFoldersSource: deps?.saveGuildFoldersSource ?? null,
+            saveGuildFoldersConfidence: saveConfidence
+        });
+
+        const nextFolders = buildGuildFoldersForMoveToTop(currentFolders, guildId);
+        if (nextFolders) {
+            try {
+                saveGuildFolders(nextFolders);
+                logger?.debug("saveGuildFolders called", {
+                    nextFolders: summarizeFolders(nextFolders)
+                });
+                const movedByFolders = await waitForGuildAtTop(guildId, deps.getGuildOrder, pollIntervalMs, pollTimeoutMs);
+                if (movedByFolders) return {status: "moved"};
+                logger?.warn("saveGuildFolders strategy did not move guild to top within timeout");
+            }
+            catch (error) {
+                if (isInvalidSaveGuildFoldersError(error)) {
+                    disableSaveGuildFoldersStrategy(deps, saveGuildFolders);
+                    logger?.debug("saveGuildFolders strategy looked invalid and was disabled", {
+                        error: String(error?.message ?? error)
+                    });
+                }
+                else {
+                    logger?.warn("saveGuildFolders strategy threw", error);
+                }
+            }
+        }
+        else {
+            logger?.warn("buildGuildFoldersForMoveToTop returned null", {
+                guildId,
+                currentFolders: summarizeFolders(currentFolders)
+            });
+        }
+    }
+    else if (typeof saveGuildFolders === "function" && saveConfidence <= 0) {
+        logger?.debug("Skipping saveGuildFolders move strategy because confidence is low", {
+            saveGuildFoldersSource: deps?.saveGuildFoldersSource ?? null,
+            saveGuildFoldersConfidence: saveConfidence
+        });
+    }
+
+    if (typeof move !== "function") return {status: "error", reason: "No usable move function found"};
+
+    const attempts = [
+        {name: "move(fromIndex,0)", run: () => move(fromIndex, 0)},
+        {name: "move(guildId,0)", run: () => move(guildId, 0)},
+        {name: "move({guildId,from,to})", run: () => move({guildId, from: fromIndex, to: 0})}
+    ];
+
+    for (const attempt of attempts) {
+        logger?.debug("Attempting move strategy", {
+            strategy: attempt.name,
+            fromIndex,
+            guildId
+        });
+        try {
+            attempt.run();
+        }
+        catch (error) {
+            logger?.warn("Move strategy threw", {strategy: attempt.name, error});
+            continue;
+        }
+
+        const moved = await waitForGuildAtTop(guildId, deps.getGuildOrder, pollIntervalMs, pollTimeoutMs);
+        if (moved) {
+            await persistCurrentGuildFolders(deps, logger);
+            return {status: "moved"};
+        }
+        logger?.warn("Move strategy completed but order unchanged", {
+            strategy: attempt.name,
+            currentOrder: summarizeOrder(normalizeGuildOrder(tryGet(deps.getGuildOrder)))
+        });
+    }
+
+    return {status: "error", reason: "Move function was called but guild order did not change"};
+}
+
