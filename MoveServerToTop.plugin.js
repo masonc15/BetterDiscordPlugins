@@ -392,3 +392,379 @@ function getOwnObject(candidate, key, options = {}) {
     return isObjectLike(value) ? value : null;
 }
 
+function findSaveGuildFoldersTarget(candidate, maxDepth = 3, depth = 0, visited = new Set()) {
+    if (!isObjectLike(candidate)) return null;
+    if (visited.has(candidate)) return null;
+    visited.add(candidate);
+
+    if (typeof candidate === "function" && isLikelySaveGuildFoldersFunction(candidate, "direct")) {
+        return {
+            target: null,
+            saveGuildFolders: candidate,
+            hasSaveClientTheme: false,
+            resolvedBy: "direct-function"
+        };
+    }
+
+    let saveGuildFolders =
+        getOwnFunction(candidate, "saveGuildFolders", {evaluateGetter: false}) ??
+        getOwnFunction(candidate, "saveGuildFolders", {evaluateGetter: true});
+    if (!saveGuildFolders) {
+        const directSaveGuildFolders = tryGet(() => candidate.saveGuildFolders);
+        if (typeof directSaveGuildFolders === "function") saveGuildFolders = directSaveGuildFolders;
+    }
+    if (isLikelySaveGuildFoldersFunction(saveGuildFolders, "saveGuildFolders")) {
+        let saveClientTheme =
+            getOwnFunction(candidate, "saveClientTheme", {evaluateGetter: false}) ??
+            getOwnFunction(candidate, "saveClientTheme", {evaluateGetter: true});
+        if (!saveClientTheme) {
+            const directSaveClientTheme = tryGet(() => candidate.saveClientTheme);
+            if (typeof directSaveClientTheme === "function") saveClientTheme = directSaveClientTheme;
+        }
+        return {
+            target: candidate,
+            saveGuildFolders,
+            hasSaveClientTheme: !!saveClientTheme,
+            resolvedBy: "named-saveGuildFolders"
+        };
+    }
+
+    const descriptors = tryGet(() => Object.getOwnPropertyDescriptors(candidate)) ?? {};
+    const descriptorEntries = Object.entries(descriptors).slice(0, 48);
+    for (const [key, descriptor] of descriptorEntries) {
+        if (SAVE_GUILD_FOLDERS_BLOCKED_KEYS.has(String(key).toLowerCase())) continue;
+        if (!descriptor || !("value" in descriptor)) continue;
+        const value = descriptor.value;
+        if (!isLikelySaveGuildFoldersFunction(value, key)) continue;
+
+        const saveClientTheme = getOwnFunction(candidate, "saveClientTheme", {evaluateGetter: false});
+        return {
+            target: candidate,
+            saveGuildFolders: value,
+            hasSaveClientTheme: !!saveClientTheme,
+            resolvedBy: `source-heuristic:${key}`
+        };
+    }
+
+    if (depth >= maxDepth) return null;
+
+    const libraryModules = getOwnObject(candidate, "LibraryModules", {evaluateGetter: true});
+    const knownBranches = [
+        getOwnObject(candidate, "default", {evaluateGetter: true}),
+        getOwnObject(candidate, "Z", {evaluateGetter: true}),
+        getOwnObject(candidate, "ZP", {evaluateGetter: true}),
+        getOwnObject(candidate, "exports", {evaluateGetter: true}),
+        getOwnObject(candidate, "FolderSettingsUtils", {evaluateGetter: true}),
+        libraryModules,
+        getOwnObject(libraryModules, "FolderSettingsUtils", {evaluateGetter: true})
+    ];
+
+    for (const branch of knownBranches) {
+        if (!branch) continue;
+        const found = findSaveGuildFoldersTarget(branch, maxDepth, depth + 1, visited);
+        if (found) return found;
+    }
+
+    const keys = tryGet(() => Object.keys(candidate)) ?? [];
+    for (const key of keys.slice(0, 24)) {
+        const value = getOwnObject(candidate, key, {evaluateGetter: false});
+        if (!value) continue;
+        const found = findSaveGuildFoldersTarget(value, maxDepth, depth + 1, visited);
+        if (found) return found;
+    }
+
+    return null;
+}
+
+function resolveFolderSettingsDependencies(bdApi, logger = null) {
+    const webpack = bdApi?.Webpack;
+    const candidates = [
+        {
+            name: "window.BDFDB.LibraryModules.FolderSettingsUtils",
+            get: () => globalThis.BDFDB?.LibraryModules?.FolderSettingsUtils
+        },
+        {
+            name: "window.BDFDB_Global.BDFDB.LibraryModules.FolderSettingsUtils",
+            get: () => globalThis.BDFDB_Global?.BDFDB?.LibraryModules?.FolderSettingsUtils
+        },
+        {
+            name: "window.BDFDB_Global.PluginUtils.buildPlugin(...).LibraryModules.FolderSettingsUtils",
+            get: () => {
+                const buildPlugin = globalThis.BDFDB_Global?.PluginUtils?.buildPlugin;
+                if (typeof buildPlugin !== "function") return null;
+                const built = buildPlugin({});
+                const bdfdb = Array.isArray(built) ? built[1] : null;
+                return bdfdb?.LibraryModules?.FolderSettingsUtils ?? null;
+            }
+        },
+        {
+            name: "getByKeys(saveGuildFolders)",
+            get: () => webpack?.getByKeys?.("saveGuildFolders")
+        },
+        {
+            name: "getByKeys(saveGuildFolders,updateGuildFolders)",
+            get: () => webpack?.getByKeys?.("saveGuildFolders", "updateGuildFolders")
+        },
+        {
+            name: "getByKeys(saveGuildFolders,saveClientTheme)",
+            get: () => webpack?.getByKeys?.("saveGuildFolders", "saveClientTheme")
+        },
+        {
+            name: "getByStrings(.folderColor,clientThemeSettings:)",
+            get: () => webpack?.getByStrings?.(".folderColor", "clientThemeSettings:", {searchExports: true})
+        },
+        {
+            name: "getBySource(.folderColor,clientThemeSettings:)",
+            get: () => webpack?.getBySource?.(".folderColor", "clientThemeSettings:", {searchExports: true})
+        },
+        {
+            name: "getWithKey(saveGuildFolders source heuristic)",
+            get: () => {
+                if (typeof webpack?.getWithKey !== "function") return null;
+                const result = webpack.getWithKey(
+                    (value) => isLikelySaveGuildFoldersFunction(value),
+                    {searchExports: true}
+                );
+                if (!Array.isArray(result) || result.length < 2) return null;
+
+                const [moduleOrExport, key] = result;
+                if (typeof moduleOrExport === "function") {
+                    return {__directSaveGuildFolders: moduleOrExport};
+                }
+
+                if (!isObjectLike(moduleOrExport) || typeof key !== "string") return null;
+                const value = getOwnPropertyValue(moduleOrExport, key, {evaluateGetter: true});
+                if (typeof value !== "function") return null;
+                return {[key]: value};
+            }
+        },
+        {
+            name: "getModule(saveGuildFolders predicate)",
+            get: () => webpack?.getModule?.((module) => !!findSaveGuildFoldersTarget(module), {searchExports: true})
+        }
+    ];
+
+    for (const candidateConfig of candidates) {
+        const candidate = tryGet(candidateConfig.get);
+        const found = findSaveGuildFoldersTarget(candidate);
+
+        logger?.debug("Inspecting saveGuildFolders candidate", candidateConfig.name, {
+            found: !!candidate,
+            hasSaveGuildFolders: !!found,
+            hasSaveClientTheme: !!found?.hasSaveClientTheme
+        });
+
+        if (!found) continue;
+
+        const saveGuildFolders = found.target && found.target !== found.saveGuildFolders
+            ? found.saveGuildFolders.bind(found.target)
+            : found.saveGuildFolders;
+
+        return {
+            folderSettings: found.target,
+            saveGuildFolders,
+            saveGuildFoldersSource: found.resolvedBy ? `${candidateConfig.name} -> ${found.resolvedBy}` : candidateConfig.name,
+            saveGuildFoldersConfidence: getSaveGuildFoldersConfidence(candidateConfig.name, found.resolvedBy)
+        };
+    }
+
+    return {
+        folderSettings: null,
+        saveGuildFolders: null,
+        saveGuildFoldersSource: null,
+        saveGuildFoldersConfidence: 0
+    };
+}
+
+function getSaveGuildFoldersConfidence(candidateSource = "", resolvedBy = "") {
+    const source = String(candidateSource || "").toLowerCase();
+    const resolver = String(resolvedBy || "").toLowerCase();
+
+    const isBdfdbSource =
+        source.includes("window.bdfdb.librarymodules.foldersettingsutils") ||
+        source.includes("window.bdfdb_global.bdfdb.librarymodules.foldersettingsutils") ||
+        source.includes("window.bdfdb_global.pluginutils.buildplugin");
+    if (isBdfdbSource && resolver === "named-saveguildfolders") return 3;
+
+    if (source.includes("getbykeys(saveguildfolders") && resolver === "named-saveguildfolders") return 3;
+
+    const lowConfidenceSource =
+        source.includes("getmodule(saveguildfolders predicate)") ||
+        source.includes("getbysource(") ||
+        source.includes("getbystrings(") ||
+        source.includes("getwithkey(");
+    if (lowConfidenceSource) return 0;
+
+    if (resolver.includes("source-heuristic") || resolver === "direct-function") return 0;
+
+    if (resolver === "named-saveguildfolders") return 2;
+    return 1;
+}
+
+function resolveMoveDependencies(bdApi, logger = null) {
+    const webpack = bdApi?.Webpack;
+
+    const guildActionsCandidates = [
+        {
+            name: "getByKeys(move,toggleGuildFolderExpand)",
+            get: () => webpack?.getByKeys?.("move", "toggleGuildFolderExpand")
+        },
+        {
+            name: "getByKeys(move,createGuildFolder)",
+            get: () => webpack?.getByKeys?.("move", "createGuildFolder")
+        },
+        {
+            name: "getModule(move + folder methods)",
+            get: () => webpack?.getModule?.(
+            (module) => module && typeof module.move === "function" &&
+                (typeof module.toggleGuildFolderExpand === "function" || typeof module.createGuildFolder === "function"),
+            {searchExports: true}
+            )
+        },
+        {
+            name: "getModule(move + source heuristic)",
+            get: () => webpack?.getModule?.(
+            (module) => module && typeof module.move === "function" && /guild|folder|position/i.test(String(module.move)),
+            {searchExports: true}
+            )
+        }
+    ];
+
+    let guildActions = null;
+    let guildActionsSource = null;
+    for (const candidateConfig of guildActionsCandidates) {
+        const candidate = tryGet(candidateConfig.get);
+        logger?.debug("Inspecting guildActions candidate", candidateConfig.name, {
+            found: !!candidate,
+            hasMove: typeof candidate?.move === "function"
+        });
+        if (candidate && typeof candidate.move === "function") {
+            guildActions = candidate;
+            guildActionsSource = candidateConfig.name;
+            break;
+        }
+    }
+
+    const sortedGuildStore = tryGet(() => webpack?.getStore?.("SortedGuildStore")) ??
+        tryGet(() => webpack?.getModule?.(webpack?.Filters?.byStoreName?.("SortedGuildStore"), {searchExports: true}));
+
+    const userGuildSettingsStore = tryGet(() => webpack?.getStore?.("UserGuildSettingsStore")) ??
+        tryGet(() => webpack?.getModule?.(webpack?.Filters?.byStoreName?.("UserGuildSettingsStore"), {searchExports: true})) ??
+        tryGet(() => webpack?.getByKeys?.("guildPositions", "isMuted"));
+    const dispatcher = resolveDispatcher(bdApi);
+
+    const folderDeps = resolveFolderSettingsDependencies(bdApi, logger);
+    const folderSettings = folderDeps.folderSettings;
+    const saveGuildFolders = folderDeps.saveGuildFolders;
+    const saveGuildFoldersSource = folderDeps.saveGuildFoldersSource;
+    const saveGuildFoldersConfidence = folderDeps.saveGuildFoldersConfidence ?? 0;
+
+    logger?.debug("Dependency resolution summary", {
+        hasGuildActions: !!guildActions,
+        guildActionsSource,
+        hasSortedGuildStore: !!sortedGuildStore,
+        hasUserGuildSettingsStore: !!userGuildSettingsStore,
+        hasDispatcher: !!dispatcher,
+        hasFolderSettings: !!folderSettings,
+        hasSaveGuildFolders: typeof saveGuildFolders === "function",
+        saveGuildFoldersSource,
+        saveGuildFoldersConfidence
+    });
+
+    return {
+        guildActions,
+        guildActionsSource,
+        folderSettings,
+        saveGuildFolders,
+        saveGuildFoldersSource,
+        saveGuildFoldersConfidence,
+        dispatchGuildMoveById: typeof dispatcher?.dispatch === "function"
+            ? (sourceId, targetId, options = {}) => {
+                const payload = {
+                    type: "GUILD_MOVE_BY_ID",
+                    sourceId,
+                    targetId
+                };
+
+                if (Object.prototype.hasOwnProperty.call(options, "moveToBelow")) {
+                    payload.moveToBelow = options.moveToBelow;
+                }
+                if (Object.prototype.hasOwnProperty.call(options, "combine")) {
+                    payload.combine = options.combine;
+                }
+
+                dispatcher.dispatch(payload);
+            }
+            : null,
+        getGuildFolders: () => {
+            if (typeof sortedGuildStore?.getGuildFolders === "function") return sortedGuildStore.getGuildFolders();
+            return [];
+        },
+        getGuildOrder: () => {
+            const fromSorted = normalizeGuildOrder(getOrderFromSortedGuildStore(sortedGuildStore));
+            if (fromSorted.length > 0) return fromSorted;
+
+            const fromSettings = normalizeGuildOrder(getOrderFromSettingsStore(userGuildSettingsStore));
+            if (fromSettings.length > 0) return fromSettings;
+
+            return [];
+        }
+    };
+}
+
+function hasSaveGuildFoldersCapability(deps) {
+    return typeof (deps?.saveGuildFolders ?? deps?.folderSettings?.saveGuildFolders) === "function";
+}
+
+function getSaveGuildFoldersConfidenceFromDeps(deps) {
+    const confidence = deps?.saveGuildFoldersConfidence;
+    if (Number.isFinite(confidence)) return confidence;
+    return hasSaveGuildFoldersCapability(deps) ? 2 : 0;
+}
+
+function hasDispatchMoveByIdCapability(deps) {
+    return typeof deps?.dispatchGuildMoveById === "function";
+}
+
+function getDependenciesCapability(deps) {
+    return {
+        hasMove: typeof deps?.guildActions?.move === "function",
+        hasOrderAccessor: typeof deps?.getGuildOrder === "function",
+        hasSaveGuildFolders: hasSaveGuildFoldersCapability(deps),
+        saveGuildFoldersConfidence: getSaveGuildFoldersConfidenceFromDeps(deps),
+        hasDispatchMoveById: hasDispatchMoveByIdCapability(deps)
+    };
+}
+
+function shouldPreferDependencies(currentDeps, nextDeps) {
+    const current = getDependenciesCapability(currentDeps);
+    const next = getDependenciesCapability(nextDeps);
+
+    if (
+        current.hasSaveGuildFolders &&
+        next.hasSaveGuildFolders &&
+        next.saveGuildFoldersConfidence > current.saveGuildFoldersConfidence
+    ) {
+        return true;
+    }
+
+    if (next.hasSaveGuildFolders && !current.hasSaveGuildFolders) return true;
+    if (next.hasDispatchMoveById && !current.hasDispatchMoveById) return true;
+    if (next.hasOrderAccessor && !current.hasOrderAccessor) return true;
+    if (next.hasMove && !current.hasMove) return true;
+    return false;
+}
+
+function shouldRefreshDependenciesBeforeMove(deps) {
+    if (hasSaveGuildFoldersCapability(deps) && getSaveGuildFoldersConfidenceFromDeps(deps) <= 0) return true;
+    if (hasSaveGuildFoldersCapability(deps)) return false;
+    if (hasDispatchMoveByIdCapability(deps)) return false;
+    return true;
+}
+
+function getDependencyRefreshReason(deps) {
+    if (!hasSaveGuildFoldersCapability(deps)) return "saveGuildFolders unavailable";
+    if (getSaveGuildFoldersConfidenceFromDeps(deps) <= 0) return "saveGuildFolders confidence is low";
+    if (!hasDispatchMoveByIdCapability(deps)) return "dispatchGuildMoveById unavailable";
+    return "dependency refresh requested";
+}
