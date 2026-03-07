@@ -1132,3 +1132,190 @@ async function moveGuildToTop(guildId, deps, options = {}) {
     return {status: "error", reason: "Move function was called but guild order did not change"};
 }
 
+function showToastForResult(bdApi, result) {
+    const showToast = bdApi?.UI?.showToast;
+    if (typeof showToast !== "function") return;
+
+    if (result.status === "moved") {
+        showToast("Moved server to top.", {type: "success"});
+        return;
+    }
+
+    if (result.status === "noop") {
+        showToast("Server is already at the top.", {type: "info"});
+        return;
+    }
+
+    showToast(`Unable to move server to top: ${result.reason ?? "Unknown error"}`, {type: "error"});
+}
+
+function logError(bdApi, metaName, message, error) {
+    const logger = bdApi?.Logger;
+    if (logger && typeof logger.error === "function") {
+        logger.error(metaName, message, error);
+        return;
+    }
+    console.error(`[${metaName}] ${message}`, error);
+}
+
+class MoveServerToTop {
+    constructor(meta = {}) {
+        this.meta = meta;
+        this._unpatchContextMenu = null;
+        this._stopGuildDragTrace = null;
+        this._deps = null;
+        this._logger = null;
+    }
+
+    start() {
+        this._logger = createLogger(BdApi, this.meta?.name ?? LOGGER_SCOPE);
+        this._logger.log("start() called");
+
+        if (typeof this._unpatchContextMenu === "function") {
+            this._unpatchContextMenu();
+            this._unpatchContextMenu = null;
+            this._logger.debug("Existing context-menu patch was removed before re-patching");
+        }
+
+        this._deps = this._deps ?? resolveMoveDependencies(BdApi, this._logger);
+        this._logger.debug("Resolved dependencies on start", {
+            hasGuildActions: !!this._deps?.guildActions,
+            guildActionsSource: this._deps?.guildActionsSource ?? null,
+            hasFolderSettings: !!this._deps?.folderSettings,
+            initialOrder: summarizeOrder(tryGet(() => this._deps?.getGuildOrder?.()))
+        });
+
+        this._unpatchContextMenu = BdApi.ContextMenu.patch(MENU_NAV_ID, (menuTree, props) => {
+            try {
+                const guildId = getGuildIdFromProps(props);
+                this._logger.debug("guild-context patch callback", {
+                    guildId,
+                    hasGuild: !!props?.guild
+                });
+
+                const injected = injectMoveMenuItem(BdApi, menuTree, props, (clickedGuildId) => this._onMoveClick(clickedGuildId));
+                this._logger.debug("guild-context injection result", {guildId, injected});
+            }
+            catch (error) {
+                logError(BdApi, this.meta?.name ?? LOGGER_SCOPE, "Failed to patch guild context menu", error);
+            }
+        });
+        this._logger.log("Context menu patch registered", {navId: MENU_NAV_ID});
+
+        if (typeof this._stopGuildDragTrace === "function") {
+            this._stopGuildDragTrace();
+            this._stopGuildDragTrace = null;
+        }
+
+        if (GUILD_DRAG_TRACE_OPTIONS.enabled) {
+            this._stopGuildDragTrace = installGuildListActionTrace(
+                BdApi,
+                this.meta?.name ?? LOGGER_SCOPE,
+                this._logger,
+                GUILD_DRAG_TRACE_OPTIONS
+            );
+        }
+    }
+
+    stop() {
+        this._logger?.log("stop() called");
+        if (typeof this._unpatchContextMenu === "function") {
+            this._unpatchContextMenu();
+            this._logger?.debug("Context menu patch removed");
+        }
+        this._unpatchContextMenu = null;
+        if (typeof this._stopGuildDragTrace === "function") {
+            this._stopGuildDragTrace();
+            this._stopGuildDragTrace = null;
+        }
+        this._deps = null;
+    }
+
+    _getDependencies(options = {}) {
+        const forceRefresh = options.forceRefresh === true;
+        if (!this._deps || forceRefresh) {
+            this._deps = resolveMoveDependencies(BdApi, this._logger);
+            this._logger?.debug("Dependencies resolved lazily", {
+                hasGuildActions: !!this._deps?.guildActions,
+                guildActionsSource: this._deps?.guildActionsSource ?? null,
+                hasFolderSettings: !!this._deps?.folderSettings,
+                hasSaveGuildFolders: typeof this._deps?.saveGuildFolders === "function",
+                saveGuildFoldersSource: this._deps?.saveGuildFoldersSource ?? null
+            });
+        }
+        return this._deps;
+    }
+
+    async _onMoveClick(guildId) {
+        let deps = this._getDependencies();
+        this._logger?.log("Move action clicked", {
+            guildId,
+            preOrder: summarizeOrder(tryGet(() => deps?.getGuildOrder?.())),
+            hasSaveGuildFolders: hasSaveGuildFoldersCapability(deps),
+            saveGuildFoldersSource: deps?.saveGuildFoldersSource ?? null,
+            saveGuildFoldersConfidence: getSaveGuildFoldersConfidenceFromDeps(deps)
+        });
+
+        if (shouldRefreshDependenciesBeforeMove(deps)) {
+            this._logger?.debug("Refreshing dependencies before move", {
+                reason: getDependencyRefreshReason(deps)
+            });
+            const refreshedDeps = this._getDependencies({forceRefresh: true});
+            if (shouldPreferDependencies(deps, refreshedDeps)) {
+                this._logger?.debug("Using refreshed dependencies for move", {
+                    previous: getDependenciesCapability(deps),
+                    next: getDependenciesCapability(refreshedDeps)
+                });
+                deps = refreshedDeps;
+            }
+            else {
+                this._logger?.debug("Keeping current dependencies after refresh", {
+                    current: getDependenciesCapability(deps),
+                    refreshed: getDependenciesCapability(refreshedDeps)
+                });
+            }
+        }
+
+        let result = await moveGuildToTop(guildId, deps, {logger: this._logger});
+        if (result?.status === "error" && /order did not change/i.test(result?.reason ?? "")) {
+            this._logger?.warn("Move failed with unchanged order; refreshing dependencies and retrying once", {
+                guildId
+            });
+            const refreshedDeps = this._getDependencies({forceRefresh: true});
+            if (shouldPreferDependencies(deps, refreshedDeps)) {
+                deps = refreshedDeps;
+            }
+            result = await moveGuildToTop(guildId, deps, {logger: this._logger});
+        }
+
+        this._logger?.log("Move action result", {
+            guildId,
+            result,
+            postOrder: summarizeOrder(tryGet(() => deps?.getGuildOrder?.()))
+        });
+        showToastForResult(BdApi, result);
+        return result;
+    }
+}
+
+module.exports = MoveServerToTop;
+module.exports.__private = {
+    MENU_NAV_ID,
+    MENU_ITEM_ID,
+    MENU_LABEL,
+    injectMoveMenuItem,
+    looksLikeGuildListAction,
+    toTraceActionSnapshot,
+    isLikelySaveGuildFoldersFunction,
+    resolveDispatcher,
+    normalizeGuildOrder,
+    resolveMoveDependencies,
+    shouldRefreshDependenciesBeforeMove,
+    shouldPreferDependencies,
+    buildGuildFoldersForMoveToTop,
+    cloneGuildFoldersForSave,
+    getSettledGuildFoldersForPersistence,
+    persistCurrentGuildFolders,
+    moveGuildToTop,
+    waitForGuildAtTop
+};
