@@ -768,3 +768,203 @@ function getDependencyRefreshReason(deps) {
     if (!hasDispatchMoveByIdCapability(deps)) return "dispatchGuildMoveById unavailable";
     return "dependency refresh requested";
 }
+function wait(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function areOrdersEqual(a, b) {
+    if (!Array.isArray(a) || !Array.isArray(b)) return false;
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) {
+        if (a[i] !== b[i]) return false;
+    }
+    return true;
+}
+
+function flattenGuildFoldersToOrder(folders) {
+    if (!Array.isArray(folders)) return [];
+    const order = [];
+    for (const folder of folders) {
+        const guildIds = Array.isArray(folder?.guildIds) ? folder.guildIds : [];
+        for (const id of guildIds) {
+            if (typeof id === "string" && id.length > 0) order.push(id);
+        }
+    }
+    return order;
+}
+
+function isInvalidSaveGuildFoldersError(error) {
+    if (!error) return false;
+    const name = String(error.name ?? "");
+    const message = String(error.message ?? "").toLowerCase();
+    if (!message) return false;
+    if (message.includes("reading 'split'") || message.includes("reading \"split\"")) return true;
+    if (message.includes("requested message")) return true;
+    if (message.includes("minified react error #321")) return true;
+    if (name === "TypeError") return false;
+    return false;
+}
+
+function disableSaveGuildFoldersStrategy(deps, attemptedSaveGuildFolders) {
+    if (!deps || typeof deps !== "object") return;
+    deps._saveGuildFoldersDisabled = true;
+
+    if (deps.saveGuildFolders === attemptedSaveGuildFolders) {
+        deps.saveGuildFolders = null;
+    }
+
+    if (deps.folderSettings && deps.folderSettings.saveGuildFolders === attemptedSaveGuildFolders) {
+        deps.folderSettings.saveGuildFolders = null;
+    }
+}
+
+function cloneGuildFoldersForSave(folders) {
+    if (!Array.isArray(folders)) return null;
+
+    const cloned = [];
+    for (const folder of folders) {
+        const guildIds = Array.isArray(folder?.guildIds)
+            ? folder.guildIds.filter((id) => typeof id === "string" && id.length > 0)
+            : [];
+        if (guildIds.length === 0) continue;
+
+        const nextFolder = {guildIds: [...guildIds]};
+        if (folder && Object.prototype.hasOwnProperty.call(folder, "folderId")) {
+            nextFolder.folderId = folder.folderId ?? null;
+        }
+        if (typeof folder?.folderName === "string") {
+            nextFolder.folderName = folder.folderName;
+        }
+        if (typeof folder?.folderColor === "number") {
+            nextFolder.folderColor = folder.folderColor;
+        }
+
+        cloned.push(nextFolder);
+    }
+
+    return cloned;
+}
+
+async function getSettledGuildFoldersForPersistence(deps, options = {}) {
+    const getGuildFolders = deps?.getGuildFolders;
+    const getGuildOrder = deps?.getGuildOrder;
+    if (typeof getGuildFolders !== "function") return null;
+
+    const pollIntervalMs = options.pollIntervalMs ?? POLL_INTERVAL_MS;
+    const pollTimeoutMs = options.pollTimeoutMs ?? Math.max(POLL_TIMEOUT_MS, 800);
+    const logger = options.logger ?? null;
+
+    if (typeof getGuildOrder !== "function") return tryGet(getGuildFolders);
+
+    const started = Date.now();
+    let latestFolders = null;
+    let latestFolderOrder = [];
+    while (Date.now() - started <= pollTimeoutMs) {
+        latestFolders = tryGet(getGuildFolders);
+        latestFolderOrder = flattenGuildFoldersToOrder(latestFolders);
+        const latestOrder = normalizeGuildOrder(tryGet(getGuildOrder));
+        if (latestOrder.length > 0 && areOrdersEqual(latestFolderOrder, latestOrder)) {
+            return latestFolders;
+        }
+        await wait(pollIntervalMs);
+    }
+
+    logger?.warn("Timed out waiting for guild folders to settle before persistence", {
+        folderOrder: summarizeOrder(latestFolderOrder),
+        guildOrder: summarizeOrder(normalizeGuildOrder(tryGet(getGuildOrder)))
+    });
+    return latestFolders;
+}
+
+async function persistCurrentGuildFolders(deps, logger = null) {
+    if (!deps || deps._saveGuildFoldersDisabled) return {status: "skipped"};
+
+    const saveConfidence = getSaveGuildFoldersConfidenceFromDeps(deps);
+    if (saveConfidence <= 0) {
+        logger?.debug("Skipping persistence via low-confidence saveGuildFolders", {
+            saveGuildFoldersSource: deps?.saveGuildFoldersSource ?? null,
+            saveGuildFoldersConfidence: saveConfidence
+        });
+        return {status: "skipped"};
+    }
+
+    const saveGuildFolders = deps?.saveGuildFolders ?? deps?.folderSettings?.saveGuildFolders;
+    if (typeof saveGuildFolders !== "function" || typeof deps?.getGuildFolders !== "function") {
+        return {status: "skipped"};
+    }
+
+    const currentFolders = await getSettledGuildFoldersForPersistence(deps, {logger});
+    const savePayload = cloneGuildFoldersForSave(currentFolders);
+    if (!Array.isArray(savePayload) || savePayload.length === 0) {
+        return {status: "skipped"};
+    }
+
+    try {
+        const saveResult = saveGuildFolders(savePayload);
+        if (saveResult && typeof saveResult.then === "function") await saveResult;
+        logger?.debug("Persisted guild folders after move", {
+            folders: summarizeFolders(savePayload)
+        });
+        return {status: "persisted"};
+    }
+    catch (error) {
+        if (isInvalidSaveGuildFoldersError(error)) {
+            disableSaveGuildFoldersStrategy(deps, saveGuildFolders);
+            logger?.debug("Persistence saveGuildFolders looked invalid and was disabled", {
+                error: String(error?.message ?? error)
+            });
+            return {status: "disabled"};
+        }
+
+        logger?.warn("Persisting guild folders after move threw", error);
+        return {status: "error"};
+    }
+}
+
+async function waitForGuildAtTop(guildId, getGuildOrder, pollIntervalMs, pollTimeoutMs) {
+    const started = Date.now();
+    while (Date.now() - started <= pollTimeoutMs) {
+        const order = normalizeGuildOrder(tryGet(getGuildOrder));
+        if (order[0] === guildId) return true;
+        await wait(pollIntervalMs);
+    }
+    return false;
+}
+
+function buildGuildFoldersForMoveToTop(currentFolders, guildId) {
+    if (!Array.isArray(currentFolders)) return null;
+
+    const nextFolders = [];
+    let extracted = false;
+
+    for (const folder of currentFolders) {
+        const folderGuildIds = Array.isArray(folder?.guildIds) ? folder.guildIds : [];
+        const remainingIds = [];
+
+        for (const id of folderGuildIds) {
+            if (id === guildId) {
+                extracted = true;
+                continue;
+            }
+            remainingIds.push(id);
+        }
+
+        if (remainingIds.length === 0) continue;
+
+        // If a folder has one guild left, normalize it to plain-guild row.
+        if (remainingIds.length === 1) {
+            nextFolders.push({guildIds: [remainingIds[0]]});
+            continue;
+        }
+
+        nextFolders.push({
+            ...folder,
+            guildIds: remainingIds
+        });
+    }
+
+    if (!extracted) return null;
+    nextFolders.unshift({guildIds: [guildId]});
+    return nextFolders;
+}
+
