@@ -768,6 +768,7 @@ function getDependencyRefreshReason(deps) {
     if (!hasDispatchMoveByIdCapability(deps)) return "dispatchGuildMoveById unavailable";
     return "dependency refresh requested";
 }
+
 function wait(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
