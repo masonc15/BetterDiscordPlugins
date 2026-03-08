@@ -1,9 +1,10 @@
 /**
- * @name MoveServerToTopLocal
+ * @name MoveServerToTop
  * @author colin
  * @description Adds a guild context menu action that moves a server to the top of the server list.
  * @version 0.1.0
- * @source https://github.com/colin/betterdiscord_MoveServerToTop_plugin
+ * @source https://github.com/masonc15/BetterDiscordPlugins
+ * @updateUrl https://raw.githubusercontent.com/masonc15/BetterDiscordPlugins/main/MoveServerToTop.plugin.js
  */
 
 "use strict";
@@ -13,7 +14,7 @@ const MENU_ITEM_ID = "move-server-to-top";
 const MENU_LABEL = "Move Server to Top";
 const POLL_INTERVAL_MS = 25;
 const POLL_TIMEOUT_MS = 400;
-const LOGGER_SCOPE = "MoveServerToTopLocal";
+const LOGGER_SCOPE = "MoveServerToTop";
 const GUILD_DRAG_TRACE_OPTIONS = {
     enabled: false,
     durationMs: 0,
