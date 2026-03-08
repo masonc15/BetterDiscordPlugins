@@ -1,6 +1,6 @@
 # MoveServerToTop
 
-Discord has no built-in way to move a server to the top of your list. You can drag it, sure, but if you have dozens of servers that gets old fast. This BetterDiscord plugin adds a "Move Server to Top" option to the right-click menu on any server icon. One click and it's done.
+Reordering Discord servers past about 50 is a pain. You drag one to the top of your screen, scroll up, drag again, scroll, keep going. This plugin adds "Move Server to Top" to the server icon right-click menu.
 
 ## Installation
 
