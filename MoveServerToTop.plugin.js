@@ -481,24 +481,6 @@ function resolveFolderSettingsDependencies(bdApi, logger = null) {
     const webpack = bdApi?.Webpack;
     const candidates = [
         {
-            name: "window.BDFDB.LibraryModules.FolderSettingsUtils",
-            get: () => globalThis.BDFDB?.LibraryModules?.FolderSettingsUtils
-        },
-        {
-            name: "window.BDFDB_Global.BDFDB.LibraryModules.FolderSettingsUtils",
-            get: () => globalThis.BDFDB_Global?.BDFDB?.LibraryModules?.FolderSettingsUtils
-        },
-        {
-            name: "window.BDFDB_Global.PluginUtils.buildPlugin(...).LibraryModules.FolderSettingsUtils",
-            get: () => {
-                const buildPlugin = globalThis.BDFDB_Global?.PluginUtils?.buildPlugin;
-                if (typeof buildPlugin !== "function") return null;
-                const built = buildPlugin({});
-                const bdfdb = Array.isArray(built) ? built[1] : null;
-                return bdfdb?.LibraryModules?.FolderSettingsUtils ?? null;
-            }
-        },
-        {
             name: "getByKeys(saveGuildFolders)",
             get: () => webpack?.getByKeys?.("saveGuildFolders")
         },
@@ -580,12 +562,6 @@ function resolveFolderSettingsDependencies(bdApi, logger = null) {
 function getSaveGuildFoldersConfidence(candidateSource = "", resolvedBy = "") {
     const source = String(candidateSource || "").toLowerCase();
     const resolver = String(resolvedBy || "").toLowerCase();
-
-    const isBdfdbSource =
-        source.includes("window.bdfdb.librarymodules.foldersettingsutils") ||
-        source.includes("window.bdfdb_global.bdfdb.librarymodules.foldersettingsutils") ||
-        source.includes("window.bdfdb_global.pluginutils.buildplugin");
-    if (isBdfdbSource && resolver === "named-saveguildfolders") return 3;
 
     if (source.includes("getbykeys(saveguildfolders") && resolver === "named-saveguildfolders") return 3;
 

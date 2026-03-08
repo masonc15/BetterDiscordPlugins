@@ -127,23 +127,23 @@ describe("dependency resolution", () => {
         expect(typeof deps.saveGuildFolders).toBe("function");
     });
 
-    it("prefers BDFDB FolderSettingsUtils over heuristic webpack matches when available", () => {
+    it("resolves saveGuildFolders through BdApi.Webpack even when global library objects exist", () => {
         const move = () => {};
-        let bdfdbSaveGuildFoldersCalls = 0;
-        function bdfdbSaveGuildFolders(guildFolders) {
-            bdfdbSaveGuildFoldersCalls += 1;
+        let webpackSaveCalls = 0;
+        let globalSaveCalls = 0;
+
+        function webpackSaveGuildFolders(guildFolders) {
+            webpackSaveCalls += 1;
             return guildFolders;
         }
-        const heuristicModule = {
-            // Looks like a match to heuristic resolver but should be lower priority.
-            xY: () => ".folderColor,clientThemeSettings:"
-        };
 
         const oldBdfdb = globalThis.BDFDB;
         globalThis.BDFDB = {
             LibraryModules: {
                 FolderSettingsUtils: {
-                    saveGuildFolders: bdfdbSaveGuildFolders
+                    saveGuildFolders: () => {
+                        globalSaveCalls += 1;
+                    }
                 }
             }
         };
@@ -151,8 +151,11 @@ describe("dependency resolution", () => {
         try {
             const bdApi = {
                 Webpack: {
-                    getByKeys: (a, b) => (a === "move" && b === "toggleGuildFolderExpand" ? {move} : null),
-                    getBySource: () => heuristicModule,
+                    getByKeys: (a, b) => {
+                        if (a === "move" && b === "toggleGuildFolderExpand") return {move};
+                        if (a === "saveGuildFolders") return {saveGuildFolders: webpackSaveGuildFolders};
+                        return null;
+                    },
                     getStore: (name) => {
                         if (name === "SortedGuildStore") return {getGuildIds: () => ["g1", "g2"]};
                         return null;
@@ -163,54 +166,11 @@ describe("dependency resolution", () => {
             const deps = __private.resolveMoveDependencies(bdApi);
             expect(typeof deps.saveGuildFolders).toBe("function");
             deps.saveGuildFolders([{guildIds: ["g1"]}]);
-            expect(bdfdbSaveGuildFoldersCalls).toBe(1);
+            expect(webpackSaveCalls).toBe(1);
+            expect(globalSaveCalls).toBe(0);
         }
         finally {
             globalThis.BDFDB = oldBdfdb;
-        }
-    });
-
-    it("resolves saveGuildFolders from BDFDB_Global.PluginUtils.buildPlugin output", () => {
-        const move = () => {};
-        let saveCalls = 0;
-        function bdfdbSaveGuildFolders(guildFolders) {
-            saveCalls += 1;
-            return guildFolders;
-        }
-        const oldBdfdbGlobal = globalThis.BDFDB_Global;
-        globalThis.BDFDB_Global = {
-            PluginUtils: {
-                buildPlugin: () => [
-                    class FakePlugin {},
-                    {
-                        LibraryModules: {
-                            FolderSettingsUtils: {
-                                saveGuildFolders: bdfdbSaveGuildFolders
-                            }
-                        }
-                    }
-                ]
-            }
-        };
-
-        try {
-            const bdApi = {
-                Webpack: {
-                    getByKeys: (a, b) => (a === "move" && b === "toggleGuildFolderExpand" ? {move} : null),
-                    getStore: (name) => {
-                        if (name === "SortedGuildStore") return {getGuildIds: () => ["g1", "g2"]};
-                        return null;
-                    }
-                }
-            };
-
-            const deps = __private.resolveMoveDependencies(bdApi);
-            expect(typeof deps.saveGuildFolders).toBe("function");
-            deps.saveGuildFolders([{guildIds: ["g1"]}]);
-            expect(saveCalls).toBe(1);
-        }
-        finally {
-            globalThis.BDFDB_Global = oldBdfdbGlobal;
         }
     });
 
